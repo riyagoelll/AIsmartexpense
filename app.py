@@ -111,10 +111,32 @@ class ActivityLog(db.Model):
     timestamp  = db.Column(db.DateTime, default=datetime.utcnow)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def log_activity(action, user_id=None, details=None):
-    db.session.add(ActivityLog(user_id=user_id, action=action,
-                               details=details, ip_address=request.remote_addr))
-    db.session.commit()
+
+# ════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ════════════════════════════════════════════════════════════════
+
+def get_real_ip():
+    """Get real user IP from proxy headers"""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or 'Unknown'
+
+def log_activity(action, user_id=None, details=''):
+    """Log user activity to database"""
+    try:
+        log = ActivityLog(
+            user_id=user_id,
+            action=action,
+            details=details,
+            ip_address=get_real_ip()
+        )
+        db.session.add(log)
+        db.session.commit()
+    except Exception as e:
+        print(f"Logging error: {e}")
+
+# ════════════════════════════════════════════════════════════════
 
 def generate_token(user_id):
     return jwt.encode(
@@ -479,7 +501,8 @@ def signup():
     u = User(name=d['name'], email=d['email'].lower(),
              password=bcrypt.generate_password_hash(d['password']).decode('utf-8'))
     db.session.add(u); db.session.commit()
-    log_activity('signup', u.id, f"New: {u.email}")
+    log_activity('signup', user.id, f"New: {email}")
+
     resp = jsonify({'message':'Account created!', 'name':u.name})
     resp.set_cookie('token', generate_token(u.id), httponly=True, max_age=7*24*3600)
     return resp, 201
