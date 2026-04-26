@@ -32,19 +32,6 @@ bcrypt = Bcrypt(app)
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-try:
-    from apscheduler.triggers.cron import CronTrigger
-    scheduler.add_job(
-        process_recurring_expenses,
-        trigger=CronTrigger(hour=0, minute=0),  # 12:00 AM daily
-        id='recurring_expenses',
-        name='Process recurring expenses',
-        replace_existing=True
-    )
-    print("✅ Scheduler started for recurring expenses")
-except Exception as e:
-    print(f"⚠️ Scheduler error: {e}")
-
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'riya_admin')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'Admin@Secure2025!')
 CATEGORIES     = ['Food','Bills','Transport','Shopping','Entertainment','Health','Others']
@@ -110,33 +97,31 @@ class ActivityLog(db.Model):
     ip_address = db.Column(db.String(50))
     timestamp  = db.Column(db.DateTime, default=datetime.utcnow)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
+# ── HELPER FUNCTIONS  (must be defined BEFORE anything uses them)
 # ════════════════════════════════════════════════════════════════
 
 def get_real_ip():
-    """Get real user IP from proxy headers"""
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    """Get real user IP — works behind Railway / Render / Vercel proxies"""
+    forwarded = request.headers.get('X-Forwarded-For', '')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
     return request.remote_addr or 'Unknown'
 
 def log_activity(action, user_id=None, details=''):
-    """Log user activity to database"""
+    """Log any user/admin action to ActivityLog table"""
     try:
-        log = ActivityLog(
-            user_id=user_id,
-            action=action,
-            details=details,
-            ip_address=get_real_ip()
-        )
-        db.session.add(log)
+        db.session.add(ActivityLog(
+            user_id    = user_id,
+            action     = action,
+            details    = details or '',
+            ip_address = get_real_ip()
+        ))
         db.session.commit()
     except Exception as e:
-        print(f"Logging error: {e}")
-
-# ════════════════════════════════════════════════════════════════
+        print(f"⚠️ log_activity error: {e}")
+        db.session.rollback()
 
 def generate_token(user_id):
     return jwt.encode(
@@ -284,6 +269,79 @@ def generate_ai_insights(user_id, ref_year=None, ref_month=None):
 
     return insights[:7]
 
+
+# ════════════════════════════════════════════════════════════════
+# ── RECURRING EXPENSES PROCESSOR
+# ════════════════════════════════════════════════════════════════
+
+def process_recurring_expenses():
+    """Auto-add recurring expenses — runs daily at 12 AM via scheduler"""
+    today = date.today()
+    recurring_list = RecurringExpense.query.filter_by(is_active=True).all()
+
+    for rec in recurring_list:
+        if rec.end_date and today > rec.end_date:
+            continue
+
+        should_add = False
+
+        if rec.frequency == 'daily':
+            should_add = True
+
+        elif rec.frequency == 'weekly':
+            if rec.last_added_date is None:
+                should_add = True
+            elif (today - rec.last_added_date).days >= 7:
+                should_add = True
+
+        elif rec.frequency == 'biweekly':
+            if rec.last_added_date is None:
+                should_add = True
+            elif (today - rec.last_added_date).days >= 14:
+                should_add = True
+
+        elif rec.frequency == 'monthly':
+            if rec.last_added_date is None:
+                should_add = True
+            elif today.day == rec.start_date.day and (today - rec.last_added_date).days >= 28:
+                should_add = True
+
+        if should_add:
+            try:
+                exp = Expense(
+                    user_id     = rec.user_id,
+                    amount      = rec.amount,
+                    category    = rec.category,
+                    description = f"{rec.description} (recurring)",
+                    date        = today,
+                    is_surprise = False
+                )
+                db.session.add(exp)
+                rec.last_added_date = today
+                log_activity('auto_recurring_added', rec.user_id,
+                             f"Auto: {rec.description} - ₹{rec.amount}")
+                db.session.commit()
+                print(f"✅ Recurring added: {rec.description} for user {rec.user_id}")
+            except Exception as e:
+                print(f"❌ Recurring error: {e}")
+                db.session.rollback()
+
+
+# ── Schedule recurring job AFTER the function is defined ──────────────────────
+try:
+    from apscheduler.triggers.cron import CronTrigger
+    scheduler.add_job(
+        process_recurring_expenses,
+        trigger=CronTrigger(hour=0, minute=0),
+        id='recurring_expenses',
+        name='Process recurring expenses',
+        replace_existing=True
+    )
+    print("✅ Scheduler started for recurring expenses")
+except Exception as e:
+    print(f"⚠️ Scheduler error: {e}")
+
+
 # ── TELEGRAM FUNCTIONS ────────────────────────────────────────────────────────
 def send_telegram_message(chat_id, text):
     """Send message via Telegram Bot API"""
@@ -299,11 +357,9 @@ def parse_telegram_message(text, user_id):
     text = text.lower().strip()
     u = User.query.get(user_id)
     
-    # /start
     if text.startswith('/start'):
         return f"👋 Namaste {u.name}!\n\nSmartExpense AI mein welcome! Commands:\n/expense food 350 lunch\n/balance\n/summary\n/insights\n/help"
     
-    # /expense food 350 lunch
     elif text.startswith('/expense '):
         parts = text[9:].split()
         if len(parts) >= 3:
@@ -326,7 +382,6 @@ def parse_telegram_message(text, user_id):
                     return "❌ Invalid amount"
         return "❌ Format: /expense category amount description\nExample: /expense food 350 lunch"
     
-    # /balance
     elif text == '/balance':
         today = date.today()
         start = date(today.year, today.month, 1)
@@ -336,7 +391,6 @@ def parse_telegram_message(text, user_id):
         pct = round(spent/u.monthly_budget*100) if u.monthly_budget > 0 else 0
         return f"💰 <b>Monthly Balance</b>\n\n💸 Spent: ₹{spent:,.0f}\n🏦 Budget: ₹{u.monthly_budget:,.0f}\n✅ Remaining: ₹{rem:,.0f}\n📊 Used: {pct}%"
     
-    # /summary
     elif text == '/summary':
         today = date.today()
         start = date(today.year, today.month, 1)
@@ -350,17 +404,16 @@ def parse_telegram_message(text, user_id):
         summary += f"\n<b>Total: ₹{sum(cats.values()):,.0f}</b>"
         return summary
     
-    # /insights
     elif text == '/insights':
         ins = generate_ai_insights(user_id)
         return "🤖 <b>AI Insights</b>\n\n" + "\n\n".join(ins[:3])
     
-    # /help
     elif text == '/help':
         return "📖 <b>Commands</b>\n\n/expense category amount description\n/balance\n/summary\n/insights\n/help"
     
     else:
         return "❓ Command not recognized. Type /help for commands."
+
 
 # ── EMAIL FUNCTIONS ───────────────────────────────────────────────────────────
 def send_email(to_email, subject, html_content):
@@ -371,7 +424,6 @@ def send_email(to_email, subject, html_content):
         msg['From'] = SES_FROM_EMAIL
         msg['To'] = to_email
         msg.attach(MIMEText(html_content, 'html'))
-        
         with smtplib.SMTP(SES_SMTP_SERVER, SES_SMTP_PORT) as server:
             server.starttls()
             server.login(SES_SMTP_USER, SES_SMTP_PASS)
@@ -451,17 +503,20 @@ def generate_weekly_email(user_id):
     return html
 
 def send_weekly_emails():
-    """Scheduled task to send weekly emails every Sunday 6 PM"""
+    """Scheduled task — every Sunday 6 PM IST (12:30 PM UTC)"""
     users = User.query.filter(User.telegram_id != None).all()
     for u in users:
         html = generate_weekly_email(u.id)
-        send_email(u.email, f"SmartExpense Weekly Report - {date.today().strftime('%b %d, %Y')}", html)
+        send_email(u.email,
+                   f"SmartExpense Weekly Report - {date.today().strftime('%b %d, %Y')}",
+                   html)
 
-# Schedule weekly emails - Sunday 6 PM IST (12:30 PM UTC)
+# Schedule weekly emails
 try:
     scheduler.add_job(send_weekly_emails, 'cron', day_of_week=6, hour=12, minute=30)
 except:
     pass
+
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route('/')
@@ -493,7 +548,6 @@ def signup():
         return jsonify({'error':'All fields required'}), 400
     if not is_valid_email(d['email'].lower()):
         return jsonify({'error': 'Invalid email format'}), 400
-        
     if int(d.get('captcha','-1')) != session.get('captcha_answer'):
         return jsonify({'error':'Wrong CAPTCHA answer'}), 400
     if User.query.filter_by(email=d['email'].lower()).first():
@@ -501,8 +555,7 @@ def signup():
     u = User(name=d['name'], email=d['email'].lower(),
              password=bcrypt.generate_password_hash(d['password']).decode('utf-8'))
     db.session.add(u); db.session.commit()
-    log_activity('signup', user.id, f"New: {email}")
-
+    log_activity('signup', u.id, f"New user: {u.email}")
     resp = jsonify({'message':'Account created!', 'name':u.name})
     resp.set_cookie('token', generate_token(u.id), httponly=True, max_age=7*24*3600)
     return resp, 201
@@ -510,16 +563,17 @@ def signup():
 @app.route('/api/login', methods=['POST'])
 def login():
     d = request.get_json()
-    if not is_valid_email(d['email'].lower()):
+    if not is_valid_email(d.get('email', '').lower()):
         return jsonify({'error': 'Invalid email format'}), 400
     if int(d.get('captcha','-1')) != session.get('captcha_answer'):
-        log_activity('failed_login', details=f"CAPTCHA: {d.get('email')}")
+        log_activity('failed_login', details=f"Wrong CAPTCHA: {d.get('email')}")
         return jsonify({'error':'Wrong CAPTCHA answer'}), 400
     u = User.query.filter_by(email=d.get('email','').lower()).first()
     if not u or not bcrypt.check_password_hash(u.password, d.get('password','')):
-        log_activity('failed_login', details=f"Creds: {d.get('email')}")
+        log_activity('failed_login', details=f"Bad credentials: {d.get('email')}")
         return jsonify({'error':'Invalid email or password'}), 401
     if u.is_blocked:
+        log_activity('blocked_login_attempt', u.id, f"Blocked user tried: {u.email}")
         return jsonify({'error':'Account blocked. Contact support.'}), 403
     log_activity('login', u.id, f"Login: {u.email}")
     resp = jsonify({'message':'Login successful!', 'name':u.name})
@@ -535,7 +589,7 @@ def demo_login():
                     is_demo=True, monthly_budget=25000)
         db.session.add(demo); db.session.commit()
         _load_demo(demo.id)
-    log_activity('demo_login', demo.id)
+    log_activity('demo_login', demo.id, 'Demo login')
     resp = jsonify({'message':'Demo login!', 'name':demo.name})
     resp.set_cookie('token', generate_token(demo.id), httponly=True, max_age=7*24*3600)
     return resp
@@ -557,6 +611,7 @@ def dashboard():
     except: return redirect(url_for('index'))
     return render_template('dashboard.html', user=u)
 
+
 # ── TELEGRAM WEBHOOK ──────────────────────────────────────────────────────────
 @app.route('/webhook/telegram', methods=['POST'])
 def telegram_webhook():
@@ -564,26 +619,20 @@ def telegram_webhook():
         update = request.get_json()
         if 'message' not in update:
             return jsonify({'ok': True})
-        
-        msg = update['message']
+        msg     = update['message']
         chat_id = msg['chat']['id']
-        text = msg.get('text', '')
-        
-        # Find user by telegram ID
+        text    = msg.get('text', '')
         u = User.query.filter_by(telegram_id=str(chat_id)).first()
-        
         if not u:
             send_telegram_message(chat_id, "❌ Please link your Telegram account in Dashboard Settings first!")
             return jsonify({'ok': True})
-        
-        # Parse and respond
         response = parse_telegram_message(text, u.id)
         send_telegram_message(chat_id, response)
-        
         return jsonify({'ok': True})
     except Exception as e:
         print(f"Webhook error: {e}")
         return jsonify({'ok': True})
+
 
 # ── Expense API ───────────────────────────────────────────────────────────────
 @app.route('/api/expenses', methods=['GET'])
@@ -630,14 +679,17 @@ def update_expense(u, eid):
     if 'date' in d: exp.date = datetime.strptime(d['date'],'%Y-%m-%d').date()
     exp.is_surprise = is_surprise(u.id, exp.category, exp.amount)
     db.session.commit()
+    log_activity('expense_updated', u.id, f"ID {eid}: {exp.category} ₹{exp.amount}")
     return jsonify({'message':'Updated!'})
 
 @app.route('/api/expenses/<int:eid>', methods=['DELETE'])
 @token_required
 def delete_expense(u, eid):
     exp = Expense.query.filter_by(id=eid, user_id=u.id).first_or_404()
+    log_activity('expense_deleted', u.id, f"ID {eid}: {exp.category} ₹{exp.amount}")
     db.session.delete(exp); db.session.commit()
     return jsonify({'message':'Deleted!'})
+
 
 # ── Summary & Analytics ───────────────────────────────────────────────────────
 @app.route('/api/summary')
@@ -685,7 +737,9 @@ def get_history(u):
 @app.route('/api/budget', methods=['PUT'])
 @token_required
 def update_budget(u):
-    u.monthly_budget = float(request.get_json().get('budget', u.monthly_budget))
+    new_budget = float(request.get_json().get('budget', u.monthly_budget))
+    log_activity('budget_updated', u.id, f"₹{u.monthly_budget} → ₹{new_budget}")
+    u.monthly_budget = new_budget
     db.session.commit()
     return jsonify({'message':'Budget updated!','budget':u.monthly_budget})
 
@@ -696,8 +750,11 @@ def link_telegram(u):
     telegram_id = d.get('telegram_id', '').strip('@')
     u.telegram_id = telegram_id
     db.session.commit()
-    send_telegram_message(telegram_id, f"✅ Linked successfully! Now you can use /expense commands. Type /help for all commands.")
+    log_activity('telegram_linked', u.id, f"Telegram ID: {telegram_id}")
+    send_telegram_message(telegram_id,
+        f"✅ Linked successfully! Now you can use /expense commands. Type /help for all commands.")
     return jsonify({'message':'Telegram linked!', 'telegram_id': telegram_id})
+
 
 # ── Demo Data ─────────────────────────────────────────────────────────────────
 def _load_demo(user_id):
@@ -743,7 +800,9 @@ def _load_demo(user_id):
 @token_required
 def load_demo_data(u):
     _load_demo(u.id); u.xp = 150; db.session.commit()
+    log_activity('demo_data_loaded', u.id, '3 months demo data loaded')
     return jsonify({'message':'3 months of real demo data loaded!'})
+
 
 # ── Export ────────────────────────────────────────────────────────────────────
 @app.route('/api/export/csv')
@@ -757,11 +816,13 @@ def export_csv(u):
                     e.description, e.amount, e.notes or '',
                     'Yes' if e.is_surprise else 'No'])
     out.seek(0)
+    log_activity('csv_exported', u.id, f"{len(exps)} expenses exported")
     return make_response(out.getvalue(), 200,
         {'Content-Type':'text/csv',
          'Content-Disposition':f'attachment; filename=expenses_{u.name}.csv'})
 
-# ── ADMIN (FIXED) ──────────────────────────────────────────────────────────────
+
+# ── ADMIN ──────────────────────────────────────────────────────────────────────
 @app.route('/admin')
 def admin_page():
     if session.get('admin_logged_in'):
@@ -774,9 +835,9 @@ def admin_login():
     if d.get('username')==ADMIN_USERNAME and d.get('password')==ADMIN_PASSWORD:
         session['admin_logged_in'] = True
         session.permanent = True
-        log_activity('admin_login', details=f'Admin from {request.remote_addr}')
+        log_activity('admin_login', details=f'Admin login from {get_real_ip()}')
         return jsonify({'success': True})
-    log_activity('admin_failed_login', details=f'Failed from {request.remote_addr}')
+    log_activity('admin_failed_login', details=f'Failed admin login from {get_real_ip()}')
     return jsonify({'error':'Invalid credentials'}), 401
 
 @app.route('/api/admin/check')
@@ -816,12 +877,15 @@ def admin_block(uid):
     if not session.get('admin_logged_in'): return jsonify({'error':'Unauthorized'}), 401
     u = User.query.get_or_404(uid)
     u.is_blocked = not u.is_blocked; db.session.commit()
+    log_activity('admin_block_toggle', details=f"User {uid} → {'blocked' if u.is_blocked else 'unblocked'}")
     return jsonify({'message':f"{'Blocked' if u.is_blocked else 'Unblocked'}!", 'is_blocked':u.is_blocked})
 
 @app.route('/api/admin/delete/<int:uid>', methods=['DELETE'])
 def admin_delete(uid):
     if not session.get('admin_logged_in'): return jsonify({'error':'Unauthorized'}), 401
-    u = User.query.get_or_404(uid); db.session.delete(u); db.session.commit()
+    u = User.query.get_or_404(uid)
+    log_activity('admin_delete_user', details=f"Deleted user {uid}: {u.email}")
+    db.session.delete(u); db.session.commit()
     return jsonify({'message':'Deleted!'})
 
 @app.route('/api/admin/export')
@@ -842,13 +906,15 @@ def admin_export():
 
 @app.route('/api/admin/logout', methods=['POST'])
 def admin_logout():
+    log_activity('admin_logout', details=f'Admin logout from {get_real_ip()}')
     session.pop('admin_logged_in', None)
     return jsonify({'message':'Logged out'})
 
+
+# ── Recurring Expense Routes ───────────────────────────────────────────────────
 @app.route('/api/recurring', methods=['GET'])
 @token_required
 def get_recurring(u):
-    """Get all recurring expenses"""
     try:
         recurring = RecurringExpense.query.filter_by(user_id=u.id, is_active=True).all()
         return jsonify([{
@@ -865,189 +931,77 @@ def get_recurring(u):
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'error': 'Failed to fetch'}), 500
- 
- 
+
 @app.route('/api/recurring', methods=['POST'])
 @token_required
 def add_recurring(u):
-    """Add new recurring expense"""
     try:
-        d = request.get_json()
-        
-        amt = float(d['amount'])
-        cat = d['category']
+        d    = request.get_json()
+        amt  = float(d['amount'])
+        cat  = d['category']
         desc = d['description']
         freq = d['frequency']
-        start = datetime.strptime(d['start_date'], '%Y-%m-%d').date()
-        end = datetime.strptime(d['end_date'], '%Y-%m-%d').date() if d.get('end_date') else None
-        
+        start= datetime.strptime(d['start_date'], '%Y-%m-%d').date()
+        end  = datetime.strptime(d['end_date'], '%Y-%m-%d').date() if d.get('end_date') else None
+
         if not all([amt, cat, desc, freq, start]):
             return jsonify({'error': 'Missing required fields'}), 400
-        
         if amt <= 0:
             return jsonify({'error': 'Amount must be > 0'}), 400
-        
-        rec = RecurringExpense(
-            user_id=u.id,
-            amount=amt,
-            category=cat,
-            description=desc,
-            frequency=freq,
-            start_date=start,
-            end_date=end,
-            is_active=True
-        )
-        
+
+        rec = RecurringExpense(user_id=u.id, amount=amt, category=cat,
+                               description=desc, frequency=freq,
+                               start_date=start, end_date=end, is_active=True)
         db.session.add(rec)
         db.session.commit()
-        
         log_activity('recurring_added', u.id, f"{desc} ({freq}): ₹{amt}")
-        
         return jsonify({
             'message': '✅ Recurring added!',
             'id': rec.id,
-            'recurring': {
-                'id': rec.id,
-                'description': rec.description,
-                'amount': rec.amount,
-                'frequency': rec.frequency
-            }
+            'recurring': {'id':rec.id,'description':rec.description,
+                          'amount':rec.amount,'frequency':rec.frequency}
         }), 201
-        
     except ValueError as e:
         return jsonify({'error': f'Invalid data: {str(e)}'}), 400
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'error': 'Failed to add'}), 500
- 
- 
+
 @app.route('/api/recurring/<int:rid>', methods=['DELETE'])
 @token_required
 def delete_recurring(u, rid):
-    """Delete recurring expense"""
     try:
         rec = RecurringExpense.query.filter_by(id=rid, user_id=u.id).first()
-        
         if not rec:
             return jsonify({'error': 'Not found'}), 404
-        
         rec.is_active = False
         db.session.commit()
-        
         log_activity('recurring_deleted', u.id, f"{rec.description}")
-        
         return jsonify({'message': '✅ Deleted!'})
-        
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'error': 'Failed to delete'}), 500
- 
- 
+
 @app.route('/api/recurring/<int:rid>/toggle', methods=['POST'])
 @token_required
 def toggle_recurring(u, rid):
-    """Pause/Resume recurring"""
     try:
         rec = RecurringExpense.query.filter_by(id=rid, user_id=u.id).first()
-        
         if not rec:
             return jsonify({'error': 'Not found'}), 404
-        
         rec.is_active = not rec.is_active
         db.session.commit()
-        
         status = "resumed" if rec.is_active else "paused"
         log_activity('recurring_toggled', u.id, f"{rec.description} - {status}")
-        
-        return jsonify({
-            'message': f'✅ {status.capitalize()}!',
-            'is_active': rec.is_active
-        })
-        
+        return jsonify({'message': f'✅ {status.capitalize()}!', 'is_active': rec.is_active})
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({'error': 'Failed to toggle'}), 500
-    
-def process_recurring_expenses():
-    """Auto-add recurring expenses - runs daily at 12 AM"""
-    today = date.today()
-    
-    # Get all active recurring
-    recurring_list = RecurringExpense.query.filter_by(is_active=True).all()
-    
-    for rec in recurring_list:
-        # Skip if end date passed
-        if rec.end_date and today > rec.end_date:
-            continue
-        
-        should_add = False
-        
-        # DAILY - add every day
-        if rec.frequency == 'daily':
-            should_add = True
-        
-        # WEEKLY - add every 7 days
-        elif rec.frequency == 'weekly':
-            if rec.last_added_date is None:
-                should_add = True
-            else:
-                days_passed = (today - rec.last_added_date).days
-                if days_passed >= 7:
-                    should_add = True
-        
-        # BIWEEKLY - add every 14 days
-        elif rec.frequency == 'biweekly':
-            if rec.last_added_date is None:
-                should_add = True
-            else:
-                days_passed = (today - rec.last_added_date).days
-                if days_passed >= 14:
-                    should_add = True
-        
-        # MONTHLY - add every month on same date
-        elif rec.frequency == 'monthly':
-            if rec.last_added_date is None:
-                should_add = True
-            elif today.day == rec.start_date.day:
-                days_passed = (today - rec.last_added_date).days
-                if days_passed >= 28:
-                    should_add = True
-        
-        # Add the expense
-        if should_add:
-            try:
-                # Create expense entry
-                exp = Expense(
-                    user_id=rec.user_id,
-                    amount=rec.amount,
-                    category=rec.category,
-                    description=f"{rec.description} (recurring)",
-                    date=today,
-                    is_surprise=False
-                )
-                db.session.add(exp)
-                
-                # Update last_added_date
-                rec.last_added_date = today
-                
-                # Log it
-                log_activity(
-                    'auto_recurring_added',
-                    rec.user_id,
-                    f"Auto: {rec.description} - ₹{rec.amount}"
-                )
-                
-                db.session.commit()
-                print(f"✅ Added: {rec.description} for user {rec.user_id}")
-                
-            except Exception as e:
-                print(f"❌ Error adding recurring: {e}")
-                db.session.rollback()
- 
-
-with app.app_context(): db.create_all()
 
 
+# ── Init & Run ────────────────────────────────────────────────────────────────
+with app.app_context():
+    db.create_all()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
