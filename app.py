@@ -22,7 +22,7 @@ def is_valid_email(email):
 app = Flask(__name__)
 
 app.config['SECRET_KEY']             = os.environ.get('SECRET_KEY', 'fallback-secret')
-postgresql://postgres:sQzToICOGpVBvWWzXqpXtoCtyMLwxMfN@shortline.proxy.rlwy.net:26308/railway
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///smartexpense.db').replace('postgres://', 'postgresql://')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET']             = os.environ.get('JWT_SECRET', 'fallback-jwt')
 app.config['SESSION_COOKIE_SAMESITE']= 'Lax'
