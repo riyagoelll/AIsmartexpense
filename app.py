@@ -19,9 +19,7 @@ EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 def is_valid_email(email):
     return re.match(EMAIL_REGEX, email) is not None
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(debug=False, host='0.0.0.0', port=port)
+app = Flask(__name__)
 
 app.config['SECRET_KEY']             = os.environ.get('SECRET_KEY', 'fallback-secret')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///smartexpense.db').replace('postgres://', 'postgresql://')
@@ -1057,4 +1055,5 @@ with app.app_context():
     db.create_all()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(debug=False, host='0.0.0.0', port=port)
