@@ -274,6 +274,12 @@ def generate_ai_insights(user_id, ref_year=None, ref_month=None):
 # ── RECURRING EXPENSES PROCESSOR
 # ════════════════════════════════════════════════════════════════
 
+import logging
+from datetime import date
+
+logger = logging.getLogger(__name__)
+
+
 def process_recurring_expenses():
     """Auto-add recurring expenses — runs daily at 12 AM via scheduler"""
     with app.app_context():
@@ -281,51 +287,63 @@ def process_recurring_expenses():
         recurring_list = RecurringExpense.query.filter_by(is_active=True).all()
 
         for rec in recurring_list:
+            # Skip if past end date
             if rec.end_date and today > rec.end_date:
                 continue
 
+            last = rec.last_added_date
             should_add = False
 
             if rec.frequency == 'daily':
-                should_add = True
+                # FIX: Guard against duplicate runs on same day
+                should_add = (last is None or last < today)
 
             elif rec.frequency == 'weekly':
-                if rec.last_added_date is None:
-                    should_add = True
-                elif (today - rec.last_added_date).days >= 7:
-                    should_add = True
+                should_add = (last is None or (today - last).days >= 7)
 
             elif rec.frequency == 'biweekly':
-                if rec.last_added_date is None:
-                    should_add = True
-                elif (today - rec.last_added_date).days >= 14:
-                    should_add = True
+                should_add = (last is None or (today - last).days >= 14)
 
             elif rec.frequency == 'monthly':
-                if rec.last_added_date is None:
-                    should_add = True
-                elif today.day == rec.start_date.day and (today - rec.last_added_date).days >= 28:
-                    should_add = True
-
-            if should_add:
-                try:
-                    exp = Expense(
-                        user_id     = rec.user_id,
-                        amount      = rec.amount,
-                        category    = rec.category,
-                        description = f"{rec.description} (recurring)",
-                        date        = today,
-                        is_surprise = False
+                # FIX: Use month/year comparison instead of 28-day check
+                # Handles February edge case correctly
+                should_add = (
+                    today.day == rec.start_date.day and
+                    (
+                        last is None or
+                        last.year < today.year or
+                        last.month < today.month
                     )
-                    db.session.add(exp)
-                    rec.last_added_date = today
-                    log_activity('auto_recurring_added', rec.user_id,
-                                 f"Auto: {rec.description} - ₹{rec.amount}")
-                    db.session.commit()
-                    print(f"✅ Recurring added: {rec.description} for user {rec.user_id}")
-                except Exception as e:
-                    print(f"❌ Recurring error: {e}")
-                    db.session.rollback()
+                )
+
+            if not should_add:
+                continue
+
+            try:
+                exp = Expense(
+                    user_id=rec.user_id,
+                    amount=rec.amount,
+                    category=rec.category,
+                    description=f"{rec.description} (recurring)",
+                    date=today,
+                    is_surprise=False
+                )
+                db.session.add(exp)
+                rec.last_added_date = today
+                log_activity(
+                    'auto_recurring_added',
+                    rec.user_id,
+                    f"Auto: {rec.description} - ₹{rec.amount}"
+                )
+                db.session.commit()
+                logger.info(f"✅ Recurring added: {rec.description} | user={rec.user_id}")
+
+            except Exception as e:
+                db.session.rollback()
+                logger.error(
+                    f"❌ Recurring failed [rec_id={rec.id}, user={rec.user_id}]: {e}",
+                    exc_info=True
+                )
 
 # ── Schedule recurring job AFTER the function is defined ──────────────────────
 try:
