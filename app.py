@@ -276,56 +276,56 @@ def generate_ai_insights(user_id, ref_year=None, ref_month=None):
 
 def process_recurring_expenses():
     """Auto-add recurring expenses — runs daily at 12 AM via scheduler"""
-    today = date.today()
-    recurring_list = RecurringExpense.query.filter_by(is_active=True).all()
+    with app.app_context():
+        today = date.today()
+        recurring_list = RecurringExpense.query.filter_by(is_active=True).all()
 
-    for rec in recurring_list:
-        if rec.end_date and today > rec.end_date:
-            continue
+        for rec in recurring_list:
+            if rec.end_date and today > rec.end_date:
+                continue
 
-        should_add = False
+            should_add = False
 
-        if rec.frequency == 'daily':
-            should_add = True
-
-        elif rec.frequency == 'weekly':
-            if rec.last_added_date is None:
-                should_add = True
-            elif (today - rec.last_added_date).days >= 7:
+            if rec.frequency == 'daily':
                 should_add = True
 
-        elif rec.frequency == 'biweekly':
-            if rec.last_added_date is None:
-                should_add = True
-            elif (today - rec.last_added_date).days >= 14:
-                should_add = True
+            elif rec.frequency == 'weekly':
+                if rec.last_added_date is None:
+                    should_add = True
+                elif (today - rec.last_added_date).days >= 7:
+                    should_add = True
 
-        elif rec.frequency == 'monthly':
-            if rec.last_added_date is None:
-                should_add = True
-            elif today.day == rec.start_date.day and (today - rec.last_added_date).days >= 28:
-                should_add = True
+            elif rec.frequency == 'biweekly':
+                if rec.last_added_date is None:
+                    should_add = True
+                elif (today - rec.last_added_date).days >= 14:
+                    should_add = True
 
-        if should_add:
-            try:
-                exp = Expense(
-                    user_id     = rec.user_id,
-                    amount      = rec.amount,
-                    category    = rec.category,
-                    description = f"{rec.description} (recurring)",
-                    date        = today,
-                    is_surprise = False
-                )
-                db.session.add(exp)
-                rec.last_added_date = today
-                log_activity('auto_recurring_added', rec.user_id,
-                             f"Auto: {rec.description} - ₹{rec.amount}")
-                db.session.commit()
-                print(f"✅ Recurring added: {rec.description} for user {rec.user_id}")
-            except Exception as e:
-                print(f"❌ Recurring error: {e}")
-                db.session.rollback()
+            elif rec.frequency == 'monthly':
+                if rec.last_added_date is None:
+                    should_add = True
+                elif today.day == rec.start_date.day and (today - rec.last_added_date).days >= 28:
+                    should_add = True
 
+            if should_add:
+                try:
+                    exp = Expense(
+                        user_id     = rec.user_id,
+                        amount      = rec.amount,
+                        category    = rec.category,
+                        description = f"{rec.description} (recurring)",
+                        date        = today,
+                        is_surprise = False
+                    )
+                    db.session.add(exp)
+                    rec.last_added_date = today
+                    log_activity('auto_recurring_added', rec.user_id,
+                                 f"Auto: {rec.description} - ₹{rec.amount}")
+                    db.session.commit()
+                    print(f"✅ Recurring added: {rec.description} for user {rec.user_id}")
+                except Exception as e:
+                    print(f"❌ Recurring error: {e}")
+                    db.session.rollback()
 
 # ── Schedule recurring job AFTER the function is defined ──────────────────────
 try:
