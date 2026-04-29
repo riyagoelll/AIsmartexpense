@@ -25,6 +25,39 @@ EMAIL_REGEX = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 def is_valid_email(email):
     return re.match(EMAIL_REGEX, email) is not None
 
+def validate_password(password):
+    """
+    Strong password check:
+    - Min 8 characters
+    - At least 1 uppercase letter
+    - At least 1 lowercase letter
+    - At least 1 digit
+    - At least 1 special character
+    Returns (is_valid: bool, error_message: str)
+    """
+    if len(password) < 8:
+        return False, 'Password must be at least 8 characters long'
+    if not re.search(r'[A-Z]', password):
+        return False, 'Password must contain at least one uppercase letter (A-Z)'
+    if not re.search(r'[a-z]', password):
+        return False, 'Password must contain at least one lowercase letter (a-z)'
+    if not re.search(r'[0-9]', password):
+        return False, 'Password must contain at least one number (0-9)'
+    if not re.search(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]', password):
+        return False, 'Password must contain at least one special character (!@#$%^&* etc.)'
+    return True, ''
+
+def validate_name(name):
+    """Name must be 2-50 chars, only letters and spaces"""
+    name = name.strip()
+    if len(name) < 2:
+        return False, 'Name must be at least 2 characters'
+    if len(name) > 50:
+        return False, 'Name must be under 50 characters'
+    if not re.match(r'^[a-zA-Z\s]+$', name):
+        return False, 'Name can only contain letters and spaces'
+    return True, ''
+
 app = Flask(__name__)
 
 # ── FIX: Fail fast if critical env vars missing in production ─────────────────
@@ -637,14 +670,29 @@ def signup():
     d = request.get_json()
     if not all([d.get('name'), d.get('email'), d.get('password')]):
         return jsonify({'error': 'All fields required'}), 400
+
+    # Name validation
+    name_valid, name_err = validate_name(d['name'])
+    if not name_valid:
+        return jsonify({'error': name_err}), 400
+
+    # Email validation
     if not is_valid_email(d['email'].lower()):
         return jsonify({'error': 'Invalid email format'}), 400
+
+    # Password strength validation
+    pwd_valid, pwd_err = validate_password(d['password'])
+    if not pwd_valid:
+        return jsonify({'error': pwd_err}), 400
+
+    # CAPTCHA
     if int(d.get('captcha', '-1')) != session.get('captcha_answer'):
         return jsonify({'error': 'Wrong CAPTCHA answer'}), 400
+
     if User.query.filter_by(email=d['email'].lower()).first():
         return jsonify({'error': 'Email already registered'}), 409
     u = User(
-        name     = d['name'],
+        name     = d['name'].strip(),
         email    = d['email'].lower(),
         password = bcrypt.generate_password_hash(d['password']).decode('utf-8')
     )
@@ -1100,6 +1148,23 @@ def admin_logout():
     log_activity('admin_logout', details=f'Admin logout from {get_real_ip()}')
     session.pop('admin_logged_in', None)
     return jsonify({'message': 'Logged out'})
+
+# ── TEST EMAIL (for demo / viva use) ─────────────────────────────────────────
+@app.route('/api/send-test-email')
+@admin_required
+def send_test_email_route():
+    """Send weekly report email RIGHT NOW to all non-demo users — use for viva demo"""
+    with app.app_context():
+        users = User.query.filter_by(is_demo=False, is_blocked=False).all()
+        count = 0
+        for u in users:
+            html    = generate_weekly_email(u.id)
+            subject = f"SmartExpense Weekly Report - {date.today().strftime('%b %d, %Y')}"
+            success = send_email(u.email, subject, html)
+            if success:
+                count += 1
+                log_activity('test_email_sent', u.id, f'Test email sent to {u.email}')
+        return jsonify({'message': f'✅ Test email sent to {count} user(s)!', 'count': count})
 
 
 # ── Recurring Expense Routes ──────────────────────────────────────────────────
